@@ -15,6 +15,7 @@
 /* List node */
 typedef struct list_node {
     struct list_node *next;
+    struct list_node *prev; /* Optional back pointer for O(1) removals */
     void *data;
 } list_node_t;
 
@@ -45,9 +46,11 @@ static inline list_t *list_create(void)
     }
 
     head->next = tail;
+    head->prev = NULL;
     head->data = NULL;
 
     tail->next = NULL;
+    tail->prev = head;
     tail->data = NULL;
 
     list->head = head;
@@ -91,11 +94,10 @@ static inline list_node_t *list_pushback(list_t *list, void *data)
     node->next = list->tail;
 
     /* Insert before tail sentinel */
-    list_node_t *prev = list->head;
-    while (prev->next != list->tail)
-        prev = prev->next;
+    list_node_t *prev = list->tail->prev;
     prev->next = node;
-
+    node->prev = prev;
+    list->tail->prev = node;
     list->length++;
     return node;
 }
@@ -107,7 +109,7 @@ static inline void *list_pop(list_t *list)
 
     list_node_t *first = list->head->next;
     list->head->next = first->next;
-
+    first->next->prev = list->head;
     void *data = first->data;
     free(first);
     list->length--;
@@ -120,14 +122,16 @@ static inline void *list_remove(list_t *list, list_node_t *target)
     if (unlikely(!list || !target || list_is_empty(list)))
         return NULL;
 
-    list_node_t *prev = list->head;
-    while (prev->next != list->tail && prev->next != target)
-        prev = prev->next;
+    if (unlikely(target == list->tail || target == list->head))
+        return NULL;
+
+    list_node_t *prev = target->prev;
 
     if (unlikely(prev->next != target))
         return NULL; /* node not found */
 
     prev->next = target->next;
+    target->next->prev = prev;
     void *data = target->data;
     free(target);
     list->length--;
