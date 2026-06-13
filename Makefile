@@ -8,13 +8,14 @@ BUILD_DIR := $(SRC_DIR)/build
 BUILD_APP_DIR := $(BUILD_DIR)/app
 BUILD_KERNEL_DIR := $(BUILD_DIR)/kernel
 BUILD_LIB_DIR := $(BUILD_DIR)/lib
+CROSS_COMPILE=riscv64-unknown-elf-
 
 # Apps requiring M-mode (kernel API tests)
 # All other apps run in U-mode by default (secure)
 MMODE_APPS := cond coop cpubench echo hello mqueues mutex \
               pipes pipes_small pipes_struct prodcons progress \
               rtsched semaphore suspend test64 test_libc timer timer_kill \
-              privilege_switch
+              test_list privilege_switch
 
 # Auto-detect: if building an M-mode app, enable CONFIG_PRIVILEGED
 ifneq ($(filter $(MAKECMDGOALS),$(MMODE_APPS)),)
@@ -41,7 +42,8 @@ deps += $(LIB_OBJS:%.o=%.o.d)
 APPS := coop echo hello mqueues semaphore mutex cond \
         pipes pipes_small pipes_struct prodcons progress \
         rtsched suspend test64 timer timer_kill \
-        cpubench test_libc umode privilege_switch pmp
+        cpubench test_libc umode privilege_switch pmp \
+        test_list
 
 # Output files for __link target
 IMAGE_BASE := $(BUILD_DIR)/image
