@@ -51,6 +51,9 @@ typedef enum {
     TASK_MODE_U  /* User mode - restricted, uses syscalls */
 } task_mode_t;
 
+#define TASK_ID_MAX \
+    256 /* Maximum number of tasks (limited by 16-bit ID space) */
+
 /* Priority Level Constants for Priority-Aware Time Slicing */
 #define TASK_PRIORITY_LEVELS 8  /* Number of priority levels (0-7) */
 #define TASK_HIGHEST_PRIORITY 0 /* Highest priority level */
@@ -97,7 +100,8 @@ typedef struct tcb {
     uint16_t id;        /* Unique task ID, assigned by kernel upon creation */
     uint8_t state;      /* Current lifecycle state (e.g., TASK_READY) */
     task_mode_t mode;   /* Privilege mode: TASK_MODE_M or TASK_MODE_U */
-
+    struct list_node *ready_node; /* Node pointer for ready queue (NULL if not
+                                     in ready queue) */
     /* Syscall Context Tracking (per-task, survives preemption).
      * Volatile because this flag is set/cleared around code that may be
      * preempted by timer interrupt, and checked from different code paths.
@@ -118,9 +122,15 @@ typedef struct tcb {
  */
 typedef struct {
     /* Task Management */
-    list_t *tasks; /* Master list of all tasks (nodes contain tcb_t) */
-    list_node_t *task_current; /* Node of currently running task */
+    tcb_t *tasks[TASK_ID_MAX]; /* Array of pointers to all active tasks, indexed
+                                  by ID */
+    list_t *ready_queues[TASK_PRIORITY_LEVELS]; /* Separate ready queues per
+                                                   priority level */
+    tcb_t *task_current; /* Currently running task (NULL if none) */
     jmp_buf context; /* Saved context of main kernel thread before scheduling */
+    uint16_t
+        free_tid_stack[TASK_ID_MAX]; /* Stack of freed task IDs for reuse */
+    uint16_t free_tid_count;         /* Count of free IDs in the stack */
     uint16_t next_tid;   /* Monotonically increasing ID for next new task */
     uint16_t task_count; /* Cached count of active tasks for quick access */
     bool preemptive;     /* true = preemptive; false = cooperative */
@@ -141,8 +151,6 @@ extern kcb_t *kcb;
     500 /* Safety limit for scheduler iterations to prevent livelock */
 #define MIN_TASK_STACK_SIZE \
     256 /* Minimum stack size to prevent stack overflow */
-#define TASK_CACHE_SIZE \
-    4 /* Task lookup cache size for frequently accessed tasks */
 
 /* Critical Section Macros
  *

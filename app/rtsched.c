@@ -402,28 +402,19 @@ static int32_t edf_sched(void)
     uint32_t earliest_deadline = UINT32_MAX;
 
     /* Scan all tasks to find the one with earliest deadline */
-    list_node_t *node = list_next(kcb->tasks->head);
-    while (node && node != kcb->tasks->tail) {
-        if (!node->data) {
-            node = list_next(node);
+    for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+        tcb_t *t = kcb->tasks[i];
+        if (!t || (t->state != TASK_READY && t->state != TASK_RUNNING) ||
+            !t->rt_prio)
             continue;
+
+        edf_prio_t *edf = (edf_prio_t *) t->rt_prio;
+
+        /* Track task with earliest deadline */
+        if (edf->deadline < earliest_deadline) {
+            earliest_deadline = edf->deadline;
+            earliest = t;
         }
-
-        tcb_t *task = (tcb_t *) node->data;
-
-        /* Consider both READY and RUNNING RT tasks for preemptive scheduling */
-        if ((task->state == TASK_READY || task->state == TASK_RUNNING) &&
-            task->rt_prio) {
-            edf_prio_t *edf = (edf_prio_t *) task->rt_prio;
-
-            /* Track task with earliest deadline */
-            if (edf->deadline < earliest_deadline) {
-                earliest_deadline = edf->deadline;
-                earliest = task;
-            }
-        }
-
-        node = list_next(node);
     }
 
     /* DON'T advance deadline here - that would happen on EVERY scheduler call!

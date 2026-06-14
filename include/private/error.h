@@ -50,6 +50,7 @@ enum {
     ERR_SEM_OPERATION, /* Semaphore operation failed */
     ERR_MQ_NOTEMPTY,   /* Message queue is not empty */
     ERR_TIMEOUT,       /* Operation timed out */
+    ERR_MAX_TASKS,     /* Maximum task limit reached */
 
     /* Sentinel - must remain the last entry */
     ERR_UNKNOWN /* Unknown or unclassified error */
