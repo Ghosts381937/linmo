@@ -19,7 +19,7 @@ void _timer_tick_handler(void);
 
 /* Kernel-wide control block (KCB) */
 static kcb_t kernel_state = {
-    .tasks = NULL,
+    .tasks = {NULL}, /* All task slots start as NULL (invalid) */
     .task_current = NULL,
     .rt_sched = noop_rtsched,
     .timer_list = NULL, /* Managed by timer.c, but stored here. */
@@ -78,13 +78,6 @@ static volatile uint32_t timer_work_generation = 0; /* counter for coalescing */
 /* Stack check counter for periodic validation (reduces overhead). */
 static uint32_t stack_check_counter = 0;
 #endif /* CONFIG_STACK_PROTECTION */
-
-/* Task lookup cache to accelerate frequent ID searches */
-static struct {
-    uint16_t id;
-    tcb_t *task;
-} task_cache[TASK_CACHE_SIZE];
-static uint8_t cache_index = 0;
 
 /* Priority-to-timeslice mapping table */
 static const uint8_t priority_timeslices[TASK_PRIORITY_LEVELS] = {
@@ -149,24 +142,6 @@ static inline bool is_valid_task(tcb_t *task)
             task->entry && task->id);
 }
 
-/* Add task to lookup cache */
-static inline void cache_task(uint16_t id, tcb_t *task)
-{
-    task_cache[cache_index].id = id;
-    task_cache[cache_index].task = task;
-    cache_index = (cache_index + 1) % TASK_CACHE_SIZE;
-}
-
-/* Quick cache lookup before expensive list traversal */
-static tcb_t *cache_lookup_task(uint16_t id)
-{
-    for (int i = 0; i < TASK_CACHE_SIZE; i++) {
-        if (task_cache[i].id == id && is_valid_task(task_cache[i].task))
-            return task_cache[i].task;
-    }
-    return NULL;
-}
-
 #if CONFIG_STACK_PROTECTION
 /* Stack integrity check with reduced frequency */
 static void task_stack_check(void)
@@ -178,10 +153,10 @@ static void task_stack_check(void)
     if (!should_check)
         return;
 
-    if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb || !kcb->task_current))
         panic(ERR_STACK_CHECK);
 
-    tcb_t *self = kcb->task_current->data;
+    tcb_t *self = kcb->task_current;
     if (unlikely(!is_valid_task(self)))
         panic(ERR_STACK_CHECK);
 
@@ -201,44 +176,40 @@ static void task_stack_check(void)
 #endif /* CONFIG_STACK_PROTECTION */
 
 /* Batch delay processing for blocked tasks */
-static list_node_t *delay_update_batch(list_node_t *node, void *arg)
+static void delay_update_batch(uint32_t *ready_count)
 {
-    uint32_t *ready_count = (uint32_t *) arg;
-    if (unlikely(!node || !node->data))
-        return NULL;
+    for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+        tcb_t *t = kcb->tasks[i];
+        if (!t || t->state != TASK_BLOCKED)
+            continue;
 
-    tcb_t *t = node->data;
+        /* Process delays only if tick actually advanced */
+        if (t->delay > 0) {
+            if (--t->delay == 0) {
+                t->state = TASK_READY;
 
-    /* Skip non-blocked tasks (common case) */
-    if (likely(t->state != TASK_BLOCKED))
-        return NULL;
+                /* If this is an RT task, set its deadline for the next job.
+                 * For periodic tasks, deadline should be current_time + period.
+                 * This ensures tasks are scheduled based on their actual
+                 * deadlines, not inflated values from previous scheduler calls.
+                 */
+                if (t->rt_prio) {
+                    typedef struct {
+                        uint32_t period;
+                        uint32_t deadline;
+                    } edf_prio_t;
+                    edf_prio_t *edf = (edf_prio_t *) t->rt_prio;
+                    extern kcb_t *kcb;
+                    edf->deadline = kcb->ticks + edf->period;
+                }
 
-    /* Process delays only if tick actually advanced */
-    if (t->delay > 0) {
-        if (--t->delay == 0) {
-            t->state = TASK_READY;
-
-            /* If this is an RT task, set its deadline for the next job.
-             * For periodic tasks, deadline should be current_time + period.
-             * This ensures tasks are scheduled based on their actual deadlines,
-             * not inflated values from previous scheduler calls.
-             */
-            if (t->rt_prio) {
-                typedef struct {
-                    uint32_t period;
-                    uint32_t deadline;
-                } edf_prio_t;
-                edf_prio_t *edf = (edf_prio_t *) t->rt_prio;
-                extern kcb_t *kcb;
-                edf->deadline = kcb->ticks + edf->period;
+                /* Add to appropriate priority ready queue */
+                sched_enqueue_task(t);
+                (*ready_count)++;
             }
-
-            /* Add to appropriate priority ready queue */
-            sched_enqueue_task(t);
-            (*ready_count)++;
         }
     }
-    return NULL;
+    return;
 }
 
 /* timer work processing with coalescing and prioritization */
@@ -279,67 +250,33 @@ static inline void process_deferred_timer_work(void)
 }
 
 /* delay update for cooperative mode */
-static list_node_t *delay_update(list_node_t *node, void *arg)
+static void delay_update(void)
 {
-    (void) arg;
-    if (unlikely(!node || !node->data))
-        return NULL;
+    for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+        tcb_t *t = kcb->tasks[i];
+        if (!t || t->state != TASK_BLOCKED)
+            continue;
 
-    tcb_t *t = node->data;
-
-    /* Skip non-blocked tasks (common case) */
-    if (likely(t->state != TASK_BLOCKED))
-        return NULL;
-
-    /* Decrement delay and unblock task if expired */
-    if (t->delay > 0 && --t->delay == 0) {
-        t->state = TASK_READY;
-        /* Add to appropriate priority ready queue */
-        sched_enqueue_task(t);
-    }
-    return NULL;
-}
-
-/* Task search callbacks for finding tasks in the master list. */
-static list_node_t *idcmp(list_node_t *node, void *arg)
-{
-    return (node && node->data &&
-            ((tcb_t *) node->data)->id == (uint16_t) (size_t) arg)
-               ? node
-               : NULL;
-}
-
-static list_node_t *refcmp(list_node_t *node, void *arg)
-{
-    return (node && node->data && ((tcb_t *) node->data)->entry == arg) ? node
-                                                                        : NULL;
-}
-
-/* Task lookup with caching */
-static list_node_t *find_task_node_by_id(uint16_t id)
-{
-    if (!kcb->tasks || id == 0)
-        return NULL;
-
-    /* Try cache first */
-    tcb_t *cached = cache_lookup_task(id);
-    if (cached) {
-        /* Find the corresponding node - this is still faster than full search
-         */
-        list_node_t *node = kcb->tasks->head->next;
-        while (node != kcb->tasks->tail) {
-            if (node->data == cached)
-                return node;
-            node = node->next;
+        /* Decrement delay and unblock task if expired */
+        if (t->delay > 0 && --t->delay == 0) {
+            t->state = TASK_READY;
+            /* Add to appropriate priority ready queue */
+            sched_enqueue_task(t);
         }
     }
+}
 
-    /* Fall back to full search and update cache */
-    list_node_t *node = list_foreach(kcb->tasks, idcmp, (void *) (size_t) id);
-    if (node && node->data)
-        cache_task(id, (tcb_t *) node->data);
+/* Task lookup */
+static tcb_t *find_task_node_by_id(uint16_t id)
+{
+    if (id == 0 || id >= TASK_ID_MAX)
+        return NULL;
 
-    return node;
+    if (kcb->tasks[id]) {
+        return kcb->tasks[id]; /* Return node pointer for found task */
+    }
+
+    return NULL;
 }
 
 /* Fast priority validation using lookup table */
@@ -382,41 +319,29 @@ void _yield(void) __attribute__((weak, alias("yield")));
 
 /* Zombie Task Cleanup
  *
- * Scans the task list for terminated (zombie) tasks and frees their resources.
+ * Scans the task array for terminated (zombie) tasks and frees their resources.
  * Called from dispatcher to ensure cleanup happens in a safe context.
  */
 static void task_cleanup_zombies(void)
 {
-    if (!kcb || !kcb->tasks)
+    if (!kcb)
         return;
 
-    list_node_t *node = list_next(kcb->tasks->head);
-    while (node && node != kcb->tasks->tail) {
-        list_node_t *next = list_next(node);
-        tcb_t *tcb = node->data;
+    for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+        tcb_t *tcb = kcb->tasks[i];
+        if (!tcb || tcb->state != TASK_ZOMBIE)
+            continue;
 
-        if (tcb && tcb->state == TASK_ZOMBIE) {
-            /* Remove from task list */
-            list_remove(kcb->tasks, node);
-            kcb->task_count--;
+        kcb->tasks[i] = NULL;
+        kcb->task_count--;
 
-            /* Clear from lookup cache */
-            for (int i = 0; i < TASK_CACHE_SIZE; i++) {
-                if (task_cache[i].task == tcb) {
-                    task_cache[i].id = 0;
-                    task_cache[i].task = NULL;
-                }
-            }
-
-            /* Free all resources */
-            if (tcb->mspace)
-                mo_memspace_destroy(tcb->mspace);
-            free(tcb->stack);
-            if (tcb->kernel_stack)
-                free(tcb->kernel_stack);
-            free(tcb);
-        }
-        node = next;
+        /* Free all resources */
+        if (tcb->mspace)
+            mo_memspace_destroy(tcb->mspace);
+        free(tcb->stack);
+        if (tcb->kernel_stack)
+            free(tcb->kernel_stack);
+        free(tcb);
     }
 }
 
@@ -455,10 +380,10 @@ void sched_dequeue_task(tcb_t *task)
 /* Handle time slice expiration for current task */
 void sched_tick_current_task(void)
 {
-    if (unlikely(!kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb->task_current))
         return;
 
-    tcb_t *current_task = kcb->task_current->data;
+    tcb_t *current_task = kcb->task_current;
 
     /* Decrement time slice */
     if (current_task->time_slice > 0)
@@ -507,60 +432,50 @@ void sched_wakeup_task(tcb_t *task)
  */
 uint16_t sched_select_next_task(void)
 {
-    if (unlikely(!kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb->task_current))
         panic(ERR_NO_TASKS);
 
-    tcb_t *current_task = kcb->task_current->data;
+    tcb_t *current_task = kcb->task_current;
 
     /* Mark current task as ready if it was running */
     if (current_task->state == TASK_RUNNING)
         current_task->state = TASK_READY;
 
-    /* Round-robin search: find next ready task in the master task list */
-    list_node_t *start_node = kcb->task_current;
-    list_node_t *node = start_node;
-    int iterations = 0; /* Safety counter to prevent infinite loops */
+    /* Array-based round-robin search: iterate over tasks[] */
+    uint16_t start_id = current_task->id;
+    uint16_t id = start_id;
+    int iterations = 0;
 
     do {
-        /* Move to next task (circular) */
-        node = list_cnext(kcb->tasks, node);
-        if (!node || !node->data)
+        /* Advance to next ID (circular within TASK_ID_MAX) */
+        id = (id + 1 < TASK_ID_MAX) ? (id + 1) : 1;
+        tcb_t *task = kcb->tasks[id];
+        if (!task)
             continue;
-
-        tcb_t *task = node->data;
 
         /* Skip non-ready tasks */
         if (task->state != TASK_READY)
             continue;
 
         /* Found a ready task */
-        kcb->task_current = node;
+        kcb->task_current = task; /* Update current task pointer */
         task->state = TASK_RUNNING;
         task->time_slice = get_priority_timeslice(task->prio_level);
 
         return task->id;
 
-    } while (node != start_node && ++iterations < SCHED_IMAX);
+    } while (id != start_id && ++iterations < SCHED_IMAX);
 
-    /* No ready tasks found in preemptive mode - all tasks are blocked.
-     * This is normal for periodic RT tasks waiting for their next period.
-     * We CANNOT return a BLOCKED task as that would cause it to run.
-     * Instead, find ANY task (even blocked) as a placeholder, then wait for
-     * interrupt.
-     */
+    /* No ready tasks found in preemptive mode - all tasks are blocked. */
     if (kcb->preemptive) {
-        /* Select any task as placeholder (dispatcher won't actually switch to
-         * it if blocked) */
-        list_node_t *any_node = list_next(kcb->tasks->head);
-        while (any_node && any_node != kcb->tasks->tail) {
-            if (any_node->data) {
-                kcb->task_current = any_node;
-                tcb_t *any_task = any_node->data;
+        /* Find any task as placeholder */
+        for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+            tcb_t *any_task = kcb->tasks[i];
+            if (any_task) {
+                kcb->task_current = any_task;
                 return any_task->id;
             }
-            any_node = list_next(any_node);
         }
-        /* No tasks at all - this is a real error */
         panic(ERR_NO_TASKS);
     }
 
@@ -597,7 +512,7 @@ void dispatcher(int from_timer)
 /* Top-level context-switch for preemptive scheduling. */
 void dispatch(void)
 {
-    if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb || !kcb->task_current))
         panic(ERR_NO_TASKS);
 
     /* Clean up any terminated (zombie) tasks */
@@ -609,7 +524,7 @@ void dispatch(void)
      */
     if (!kcb->preemptive) {
         /* Cooperative mode: use setjmp/longjmp mechanism */
-        if (hal_context_save(((tcb_t *) kcb->task_current->data)->context) != 0)
+        if (hal_context_save(kcb->task_current->context) != 0)
             return;
     }
 
@@ -626,30 +541,29 @@ void dispatch(void)
     uint32_t ready_count = 0;
     static uint32_t last_delay_update_tick = 0;
     if (kcb->ticks != last_delay_update_tick) {
-        list_foreach(kcb->tasks, delay_update_batch, &ready_count);
+        delay_update_batch(&ready_count);
         last_delay_update_tick = kcb->ticks;
     }
 
     /* Hook for real-time scheduler - if it selects a task, use it */
-    tcb_t *prev_task = kcb->task_current->data;
+    tcb_t *prev_task = kcb->task_current;
     int32_t rt_task_id = kcb->rt_sched();
 
     if (rt_task_id < 0) {
         sched_select_next_task(); /* Use O(n) round-robin scheduler */
     } else {
         /* RT scheduler selected a task - update current task pointer */
-        list_node_t *rt_node = find_task_node_by_id((uint16_t) rt_task_id);
-        if (rt_node && rt_node->data) {
-            tcb_t *rt_task = rt_node->data;
+        tcb_t *rt_task = find_task_node_by_id((uint16_t) rt_task_id);
+        if (rt_task) {
             /* Different task - perform context switch */
-            if (rt_node != kcb->task_current) {
-                if (kcb->task_current && kcb->task_current->data) {
-                    tcb_t *prev = kcb->task_current->data;
+            if (rt_task != kcb->task_current) {
+                if (kcb->task_current) {
+                    tcb_t *prev = kcb->task_current;
                     if (prev->state == TASK_RUNNING)
                         prev->state = TASK_READY;
                 }
                 /* Switch to RT task */
-                kcb->task_current = rt_node;
+                kcb->task_current = rt_task;
                 rt_task->state = TASK_RUNNING;
                 rt_task->time_slice =
                     get_priority_timeslice(rt_task->prio_level);
@@ -663,7 +577,7 @@ void dispatch(void)
     }
 
     /* Check if we're still on the same task (no actual switch needed) */
-    tcb_t *next_task = kcb->task_current->data;
+    tcb_t *next_task = kcb->task_current;
 
     /* In preemptive mode, if selected task has pending delay, keep trying to
      * find ready task. We check delay > 0 instead of state == BLOCKED because
@@ -672,11 +586,14 @@ void dispatch(void)
     if (kcb->preemptive) {
         int attempts = 0;
         while (next_task->delay > 0 && attempts < 10) {
-            /* Try next task in round-robin */
-            kcb->task_current = list_cnext(kcb->tasks, kcb->task_current);
-            if (!kcb->task_current || !kcb->task_current->data)
-                kcb->task_current = list_next(kcb->tasks->head);
-            next_task = kcb->task_current->data;
+            /* Try next task in array-based round-robin */
+            uint16_t next_id =
+                (next_task->id + 1 < TASK_ID_MAX) ? (next_task->id + 1) : 1;
+            tcb_t *candidate = kcb->tasks[next_id];
+            if (candidate) {
+                next_task = candidate;
+                kcb->task_current = candidate;
+            }
             attempts++;
         }
 
@@ -724,7 +641,7 @@ void dispatch(void)
 /* Cooperative context switch */
 void yield(void)
 {
-    if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb || !kcb->task_current))
         return;
 
     /* Process deferred timer work during yield */
@@ -749,7 +666,7 @@ void yield(void)
     }
 
     /* Cooperative mode: use setjmp/longjmp mechanism */
-    if (hal_context_save(((tcb_t *) kcb->task_current->data)->context) != 0)
+    if (hal_context_save(kcb->task_current->context) != 0)
         return;
 
 #if CONFIG_STACK_PROTECTION
@@ -757,18 +674,18 @@ void yield(void)
 #endif
 
     /* In cooperative mode, delays are only processed on an explicit yield. */
-    list_foreach(kcb->tasks, delay_update, NULL);
+    delay_update();
 
     /* Save current task before scheduler modifies task_current */
-    tcb_t *prev_task = (tcb_t *) kcb->task_current->data;
+    tcb_t *prev_task = kcb->task_current;
 
     sched_select_next_task(); /* Use O(1) priority scheduler */
 
     /* Switch PMP configuration if tasks have different memory spaces */
-    tcb_t *next_task = (tcb_t *) kcb->task_current->data;
+    tcb_t *next_task = kcb->task_current;
     pmp_switch_context(prev_task->mspace, next_task->mspace);
 
-    hal_context_restore(((tcb_t *) kcb->task_current->data)->context, 1);
+    hal_context_restore(kcb->task_current->context, 1);
 }
 
 /* Stack initialization with minimal overhead */
@@ -901,34 +818,21 @@ static int32_t task_spawn_internal(void *task_entry,
     /* Add to task list only after all allocations complete */
     CRITICAL_ENTER();
 
-    if (!kcb->tasks) {
-        kcb->tasks = list_create();
-        if (!kcb->tasks) {
-            CRITICAL_LEAVE();
-            if (tcb->kernel_stack)
-                free(tcb->kernel_stack);
-            free(tcb->stack);
-            free(tcb);
-            panic(ERR_KCB_ALLOC);
-        }
+    /* Assign unique ID: reuse freed ID first, otherwise allocate new */
+    uint16_t new_id;
+    if (kcb->free_tid_count > 0) {
+        new_id = kcb->free_tid_stack[--kcb->free_tid_count];
+    } else {
+        new_id = kcb->next_tid++;
+        if (new_id >= TASK_ID_MAX)
+            panic(ERR_MAX_TASKS);
     }
-
-    list_node_t *node = list_pushback(kcb->tasks, tcb);
-    if (!node) {
-        CRITICAL_LEAVE();
-        if (tcb->kernel_stack)
-            free(tcb->kernel_stack);
-        free(tcb->stack);
-        free(tcb);
-        panic(ERR_TCB_ALLOC);
-    }
-
-    /* Assign unique ID and update counts */
-    tcb->id = kcb->next_tid++;
-    kcb->task_count++; /* Cached count of active tasks for quick access */
+    tcb->id = new_id;
+    kcb->tasks[new_id] = tcb;
+    kcb->task_count++;
 
     if (!kcb->task_current)
-        kcb->task_current = node;
+        kcb->task_current = tcb;
 
     CRITICAL_LEAVE();
 
@@ -946,8 +850,7 @@ static int32_t task_spawn_internal(void *task_entry,
            tcb->id, task_entry, tcb->stack, (unsigned int) new_stack_size,
            task_mode_chars[tcb->mode], tcb->prio_level, tcb->time_slice);
 
-    /* Add to cache and mark ready */
-    cache_task(tcb->id, tcb);
+    /* Mark ready */
     sched_enqueue_task(tcb);
 
     return tcb->id;
@@ -973,8 +876,8 @@ int32_t mo_task_spawn_kernel(void *task_entry, uint16_t stack_size)
      * Uses per-task flag (tcb_t.in_syscall) which survives preemption,
      * fixing the concurrency bug where global flag was corrupted.
      */
-    if (kcb && kcb->task_current && kcb->task_current->data) {
-        tcb_t *self = kcb->task_current->data;
+    if (kcb && kcb->task_current) {
+        tcb_t *self = kcb->task_current;
         if (self->in_syscall)
             return -1;
     }
@@ -996,29 +899,20 @@ int32_t mo_task_cancel(uint16_t id)
         return ERR_TASK_CANT_REMOVE;
 
     CRITICAL_ENTER();
-    list_node_t *node = find_task_node_by_id(id);
-    if (!node) {
+    tcb_t *tcb = find_task_node_by_id(id);
+    if (!tcb) {
         CRITICAL_LEAVE();
         return ERR_TASK_NOT_FOUND;
     }
 
-    tcb_t *tcb = node->data;
-    if (!tcb || tcb->state == TASK_RUNNING) {
+    if (tcb->state == TASK_RUNNING) {
         CRITICAL_LEAVE();
         return ERR_TASK_CANT_REMOVE;
     }
 
-    /* Remove from list and update count */
-    list_remove(kcb->tasks, node);
+    /* Clear from array and update count */
+    kcb->tasks[tcb->id] = NULL;
     kcb->task_count--;
-
-    /* Clear from cache */
-    for (int i = 0; i < TASK_CACHE_SIZE; i++) {
-        if (task_cache[i].task == tcb) {
-            task_cache[i].id = 0;
-            task_cache[i].task = NULL;
-        }
-    }
 
     CRITICAL_LEAVE();
 
@@ -1046,12 +940,12 @@ void mo_task_delay(uint16_t ticks)
         return;
 
     NOSCHED_ENTER();
-    if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data)) {
+    if (unlikely(!kcb || !kcb->task_current)) {
         NOSCHED_LEAVE();
         return;
     }
 
-    tcb_t *self = kcb->task_current->data;
+    tcb_t *self = kcb->task_current;
 
     /* Set delay and blocked state - scheduler will skip blocked tasks */
     self->delay = ticks;
@@ -1067,21 +961,20 @@ int32_t mo_task_suspend(uint16_t id)
         return ERR_TASK_NOT_FOUND;
 
     CRITICAL_ENTER();
-    list_node_t *node = find_task_node_by_id(id);
-    if (!node) {
+    tcb_t *task = find_task_node_by_id(id);
+    if (!task) {
         CRITICAL_LEAVE();
         return ERR_TASK_NOT_FOUND;
     }
 
-    tcb_t *task = node->data;
-    if (!task || (task->state != TASK_READY && task->state != TASK_RUNNING &&
-                  task->state != TASK_BLOCKED)) {
+    if (task->state != TASK_READY && task->state != TASK_RUNNING &&
+        task->state != TASK_BLOCKED) {
         CRITICAL_LEAVE();
         return ERR_TASK_CANT_SUSPEND;
     }
 
     task->state = TASK_SUSPENDED;
-    bool is_current = (kcb->task_current->data == task);
+    bool is_current = (kcb->task_current == task);
 
     CRITICAL_LEAVE();
 
@@ -1097,14 +990,13 @@ int32_t mo_task_resume(uint16_t id)
         return ERR_TASK_NOT_FOUND;
 
     CRITICAL_ENTER();
-    list_node_t *node = find_task_node_by_id(id);
-    if (!node) {
+    tcb_t *task = find_task_node_by_id(id);
+    if (!task) {
         CRITICAL_LEAVE();
         return ERR_TASK_NOT_FOUND;
     }
 
-    tcb_t *task = node->data;
-    if (!task || task->state != TASK_SUSPENDED) {
+    if (task->state != TASK_SUSPENDED) {
         CRITICAL_LEAVE();
         return ERR_TASK_CANT_RESUME;
     }
@@ -1122,13 +1014,7 @@ int32_t mo_task_priority(uint16_t id, uint16_t priority)
         return ERR_TASK_INVALID_PRIO;
 
     CRITICAL_ENTER();
-    list_node_t *node = find_task_node_by_id(id);
-    if (!node) {
-        CRITICAL_LEAVE();
-        return ERR_TASK_NOT_FOUND;
-    }
-
-    tcb_t *task = node->data;
+    tcb_t *task = find_task_node_by_id(id);
     if (!task) {
         CRITICAL_LEAVE();
         return ERR_TASK_NOT_FOUND;
@@ -1149,13 +1035,7 @@ int32_t mo_task_rt_priority(uint16_t id, void *priority)
         return ERR_TASK_NOT_FOUND;
 
     CRITICAL_ENTER();
-    list_node_t *node = find_task_node_by_id(id);
-    if (!node) {
-        CRITICAL_LEAVE();
-        return ERR_TASK_NOT_FOUND;
-    }
-
-    tcb_t *task = node->data;
+    tcb_t *task = find_task_node_by_id(id);
     if (!task) {
         CRITICAL_LEAVE();
         return ERR_TASK_NOT_FOUND;
@@ -1169,21 +1049,22 @@ int32_t mo_task_rt_priority(uint16_t id, void *priority)
 
 uint16_t mo_task_id(void)
 {
-    if (unlikely(!kcb || !kcb->task_current || !kcb->task_current->data))
+    if (unlikely(!kcb || !kcb->task_current))
         return 0;
-    return ((tcb_t *) kcb->task_current->data)->id;
+    return kcb->task_current->id;
 }
 
 int32_t mo_task_idref(void *task_entry)
 {
-    if (!task_entry || !kcb->tasks)
+    if (!task_entry)
         return ERR_TASK_NOT_FOUND;
 
-    CRITICAL_ENTER();
-    list_node_t *node = list_foreach(kcb->tasks, refcmp, task_entry);
-    CRITICAL_LEAVE();
-
-    return node ? ((tcb_t *) node->data)->id : ERR_TASK_NOT_FOUND;
+    for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
+        tcb_t *task = kcb->tasks[i];
+        if (task && task->entry == task_entry)
+            return task->id;
+    }
+    return ERR_TASK_NOT_FOUND;
 }
 
 void mo_task_wfi(void)
@@ -1223,14 +1104,13 @@ uint64_t mo_uptime(void)
 
 void _sched_block(queue_t *wait_q)
 {
-    if (unlikely(!wait_q || !kcb || !kcb->task_current ||
-                 !kcb->task_current->data))
+    if (unlikely(!wait_q || !kcb || !kcb->task_current))
         panic(ERR_SEM_OPERATION);
 
     /* Process deferred timer work before blocking */
     process_deferred_timer_work();
 
-    tcb_t *self = kcb->task_current->data;
+    tcb_t *self = kcb->task_current;
 
     if (queue_enqueue(wait_q, self) != 0)
         panic(ERR_SEM_OPERATION);

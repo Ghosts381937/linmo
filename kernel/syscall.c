@@ -34,7 +34,7 @@ int do_syscall(int num, uintptr_t a1, uintptr_t a2, uintptr_t a3)
         return -ENOSYS;
 
     /* Per-task syscall context tracking (survives preemption) */
-    tcb_t *self = (kcb && kcb->task_current) ? kcb->task_current->data : NULL;
+    tcb_t *self = (kcb && kcb->task_current) ? kcb->task_current : NULL;
 
     if (self)
         self->in_syscall = true;

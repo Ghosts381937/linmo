@@ -874,7 +874,7 @@ void hal_set_kernel_stack(void *kernel_stack, size_t kernel_stack_size)
  */
 void hal_interrupt_tick(void)
 {
-    tcb_t *task = kcb->task_current->data;
+    tcb_t *task = kcb->task_current;
     if (unlikely(!task))
         hal_panic();
 

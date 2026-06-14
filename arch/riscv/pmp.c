@@ -633,10 +633,10 @@ static int32_t replace_fpage(fpage_t *victim, fpage_t *target)
 /* Handles PMP access faults by loading the required flexpage into hardware. */
 int32_t pmp_handle_access_fault(uint32_t fault_addr, uint8_t is_write)
 {
-    if (!kcb || !kcb->task_current || !kcb->task_current->data)
+    if (!kcb || !kcb->task_current)
         return PMP_FAULT_UNHANDLED;
 
-    tcb_t *current = (tcb_t *) kcb->task_current->data;
+    tcb_t *current = kcb->task_current;
     memspace_t *mspace = current->mspace;
     if (!mspace)
         return PMP_FAULT_UNHANDLED;
