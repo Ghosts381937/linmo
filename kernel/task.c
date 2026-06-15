@@ -21,6 +21,8 @@ void _timer_tick_handler(void);
 static kcb_t kernel_state = {
     .tasks = {NULL}, /* All task slots start as NULL (invalid) */
     .task_current = NULL,
+    .ready_bitmap = 0,      /* No ready queues have tasks initially */
+    .ready_queues = {NULL}, /* Initialized in main() after heap is ready */
     .rt_sched = noop_rtsched,
     .timer_list = NULL, /* Managed by timer.c, but stored here. */
     .next_tid = 1,      /* Start from 1 to avoid confusion with invalid ID 0 */
@@ -362,6 +364,12 @@ static void sched_enqueue_task(tcb_t *task)
     task->time_slice = get_priority_timeslice(task->prio_level);
     task->state = TASK_READY;
 
+    if (!kcb->ready_queues[task->prio_level])
+        kcb->ready_queues[task->prio_level] = list_create();
+
+    task->ready_node = list_pushback(kcb->ready_queues[task->prio_level], task);
+    kcb->ready_bitmap |= (1U << task->prio_level);
+
     /* Task selection is handled directly through the master task list */
 }
 
@@ -371,10 +379,20 @@ void sched_dequeue_task(tcb_t *task)
     if (unlikely(!task))
         return;
 
+    list_t *q = kcb->ready_queues[task->prio_level];
+    if (!q || list_is_empty(q) || task->state != TASK_READY)
+        return;
+
     /* For tasks that need to be removed from ready state (suspended/cancelled),
      * we rely on the state change. The scheduler will skip non-ready tasks
      * when it encounters them during the round-robin traversal.
      */
+    task->ready_node->prev->next = task->ready_node->next;
+    task->ready_node->next->prev = task->ready_node->prev;
+    free(task->ready_node);
+    task->ready_node = NULL;
+    if (list_is_empty(q))
+        kcb->ready_bitmap &= ~(1U << task->prio_level);
 }
 
 /* Handle time slice expiration for current task */
@@ -394,8 +412,10 @@ void sched_tick_current_task(void)
      * Calling _dispatch() from within dispatcher() causes double-dispatch bug.
      */
     if (current_task->time_slice == 0) {
-        if (current_task->state == TASK_RUNNING)
+        if (current_task->state == TASK_RUNNING) {
             current_task->state = TASK_READY;
+            sched_enqueue_task(current_task);
+        }
     }
 }
 
@@ -409,10 +429,31 @@ void sched_wakeup_task(tcb_t *task)
      */
     if (task->state != TASK_READY) {
         task->state = TASK_READY;
+        sched_enqueue_task(task);
         /* Ensure task has time slice */
         if (task->time_slice == 0)
             task->time_slice = get_priority_timeslice(task->prio_level);
     }
+}
+
+/* RISC-V optimized priority finding using De Bruijn sequence */
+static const uint8_t debruijn_lut[32] = {
+    0,  1,  28, 2,  29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
+    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6,  11, 5,  10, 9};
+
+/* O(1) priority selection optimized for RISC-V */
+static inline uint8_t find_highest_ready_priority_rv(uint32_t bitmap)
+{
+    if (unlikely(bitmap == 0))
+        return TASK_PRIO_IDLE; /* No ready tasks, return lowest priority */
+
+    /* Isolate rightmost set bit (highest priority) */
+    uint32_t isolated = bitmap & (-bitmap);
+
+    /* De Bruijn multiplication for O(1) bit position finding */
+    uint32_t hash = (isolated * 0x077CB531U) >> 27;
+
+    return debruijn_lut[hash & 0x1F];
 }
 
 /* Efficient Round-Robin Task Selection with O(n) Complexity
@@ -439,49 +480,26 @@ uint16_t sched_select_next_task(void)
 
     /* Mark current task as ready if it was running */
     if (current_task->state == TASK_RUNNING)
-        current_task->state = TASK_READY;
+        sched_enqueue_task(current_task);
 
-    /* Array-based round-robin search: iterate over tasks[] */
-    uint16_t start_id = current_task->id;
-    uint16_t id = start_id;
-    int iterations = 0;
-
-    do {
-        /* Advance to next ID (circular within TASK_ID_MAX) */
-        id = (id + 1 < TASK_ID_MAX) ? (id + 1) : 1;
-        tcb_t *task = kcb->tasks[id];
-        if (!task)
-            continue;
-
-        /* Skip non-ready tasks */
-        if (task->state != TASK_READY)
-            continue;
-
-        /* Found a ready task */
-        kcb->task_current = task; /* Update current task pointer */
-        task->state = TASK_RUNNING;
-        task->time_slice = get_priority_timeslice(task->prio_level);
-
-        return task->id;
-
-    } while (id != start_id && ++iterations < SCHED_IMAX);
-
-    /* No ready tasks found in preemptive mode - all tasks are blocked. */
-    if (kcb->preemptive) {
-        /* Find any task as placeholder */
+    if (kcb->ready_bitmap == 0) {
         for (uint16_t i = 1; i < TASK_ID_MAX; i++) {
-            tcb_t *any_task = kcb->tasks[i];
-            if (any_task) {
-                kcb->task_current = any_task;
-                return any_task->id;
+            if (kcb->tasks[i]) {
+                kcb->task_current = kcb->tasks[i];
+                return kcb->task_current->id;
             }
         }
         panic(ERR_NO_TASKS);
     }
 
-    /* In cooperative mode, having no ready tasks is an error */
-    panic(ERR_NO_TASKS);
-    return 0;
+    uint8_t highest = find_highest_ready_priority_rv(kcb->ready_bitmap);
+    tcb_t *task = list_pop(kcb->ready_queues[highest]);
+    if (list_is_empty(kcb->ready_queues[highest]))
+        kcb->ready_bitmap &= ~(1U << highest);
+
+    kcb->task_current = task;
+    task->state = TASK_RUNNING;
+    return task->id;
 }
 
 /* Default real-time scheduler stub. */
@@ -913,6 +931,7 @@ int32_t mo_task_cancel(uint16_t id)
     /* Clear from array and update count */
     kcb->tasks[tcb->id] = NULL;
     kcb->task_count--;
+    sched_dequeue_task(tcb);
 
     CRITICAL_LEAVE();
 
@@ -950,6 +969,8 @@ void mo_task_delay(uint16_t ticks)
     /* Set delay and blocked state - scheduler will skip blocked tasks */
     self->delay = ticks;
     self->state = TASK_BLOCKED;
+    sched_dequeue_task(
+        self); /* Remove from ready queue if currently enqueued */
     NOSCHED_LEAVE();
 
     mo_task_yield();
@@ -974,6 +995,7 @@ int32_t mo_task_suspend(uint16_t id)
     }
 
     task->state = TASK_SUSPENDED;
+    sched_dequeue_task(task);
     bool is_current = (kcb->task_current == task);
 
     CRITICAL_LEAVE();
@@ -1003,6 +1025,7 @@ int32_t mo_task_resume(uint16_t id)
 
     /* mark as ready - scheduler will find it */
     task->state = TASK_READY;
+    sched_enqueue_task(task);
 
     CRITICAL_LEAVE();
     return ERR_OK;
