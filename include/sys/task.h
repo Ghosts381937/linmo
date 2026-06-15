@@ -25,14 +25,14 @@
  * Lower base priority values mean higher priority (level 0 = highest).
  */
 enum task_priorities {
-    TASK_PRIO_CRIT = 0x0101,     /* Critical, must-run tasks (level 0) */
-    TASK_PRIO_REALTIME = 0x0303, /* Real-time tasks (level 1) */
-    TASK_PRIO_HIGH = 0x0707,     /* High priority tasks (level 2) */
-    TASK_PRIO_ABOVE = 0x0F0F,    /* Above normal priority (level 3) */
-    TASK_PRIO_NORMAL = 0x1F1F,   /* Default priority for new tasks (level 4) */
-    TASK_PRIO_BELOW = 0x3F3F,    /* Below normal priority (level 5) */
-    TASK_PRIO_LOW = 0x7F7F,      /* Low priority tasks (level 6) */
-    TASK_PRIO_IDLE = 0xFFFF      /* runs when nothing else ready (level 7) */
+    TASK_PRIO_CRIT = 0x01,     /* Critical, must-run tasks (level 0) */
+    TASK_PRIO_REALTIME = 0x03, /* Real-time tasks (level 1) */
+    TASK_PRIO_HIGH = 0x07,     /* High priority tasks (level 2) */
+    TASK_PRIO_ABOVE = 0x0F,    /* Above normal priority (level 3) */
+    TASK_PRIO_NORMAL = 0x1F,   /* Default priority for new tasks (level 4) */
+    TASK_PRIO_BELOW = 0x3F,    /* Below normal priority (level 5) */
+    TASK_PRIO_LOW = 0x7F,      /* Low priority tasks (level 6) */
+    TASK_PRIO_IDLE = 0xFF      /* runs when nothing else ready (level 7) */
 };
 
 /* Task Lifecycle States */
@@ -100,7 +100,7 @@ typedef struct tcb {
     uint16_t id;        /* Unique task ID, assigned by kernel upon creation */
     uint8_t state;      /* Current lifecycle state (e.g., TASK_READY) */
     task_mode_t mode;   /* Privilege mode: TASK_MODE_M or TASK_MODE_U */
-    struct list_node *ready_node; /* Node pointer for ready queue (NULL if not
+    list_node_t *ready_node; /* Node pointer for ready queue (NULL if not
                                      in ready queue) */
     /* Syscall Context Tracking (per-task, survives preemption).
      * Volatile because this flag is set/cleared around code that may be
@@ -126,7 +126,9 @@ typedef struct {
                                   by ID */
     list_t *ready_queues[TASK_PRIORITY_LEVELS]; /* Separate ready queues per
                                                    priority level */
-    tcb_t *task_current; /* Currently running task (NULL if none) */
+    uint8_t ready_bitmap; /* Bitmap indicating which ready queues are non-empty
+                             for O(1) scheduling */
+    tcb_t *task_current;  /* Currently running task (NULL if none) */
     jmp_buf context; /* Saved context of main kernel thread before scheduling */
     uint16_t
         free_tid_stack[TASK_ID_MAX]; /* Stack of freed task IDs for reuse */

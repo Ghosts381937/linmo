@@ -74,14 +74,14 @@ $(BUILD_DIR)/liblinmo.a: $(HAL_OBJS) $(KERNEL_OBJS) $(LIB_OBJS)
 
 # Application pattern rule
 $(APPS): %: rebuild $(BUILD_APP_DIR)/%.o linmo
-	$(Q)$(MAKE) --no-print-directory __link
+	$(Q)$(MAKE) --no-print-directory __link APP_OBJS=$(BUILD_APP_DIR)/$*.o
 
 # Link target - creates all output files
 __link: $(IMAGE_FILES)
 
-$(IMAGE_BASE).elf: $(BUILD_APP_DIR)/*.o $(BUILD_DIR)/liblinmo.a $(ENTRY_OBJ)
+$(IMAGE_BASE).elf: $(APP_OBJS) $(BUILD_DIR)/liblinmo.a $(ENTRY_OBJ)
 	$(VECHO) "  LD\t$@\n"
-	$(Q)$(LD) $(LDFLAGS) -T$(LDSCRIPT) -Map $(IMAGE_BASE).map -o $@ $(BUILD_APP_DIR)/*.o $(ENTRY_OBJ) -L$(BUILD_DIR) -llinmo
+	$(Q)$(LD) $(LDFLAGS) -T$(LDSCRIPT) -Map $(IMAGE_BASE).map -o $@ $(APP_OBJS) $(ENTRY_OBJ) -L$(BUILD_DIR) -llinmo
 
 $(IMAGE_BASE).lst: $(IMAGE_BASE).elf
 	$(VECHO) "  DUMP\t$@\n"
